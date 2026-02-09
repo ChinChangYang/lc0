@@ -83,6 +83,11 @@ class DemuxingComputation final : public NetworkComputation {
 
   void ComputeBlocking() override;
 
+  // Distribute work using configured static split sizes.
+  void EnqueueStaticSplit();
+  // Distribute work using original round-robin logic.
+  void EnqueueRoundRobin();
+
   int GetBatchSize() const override { return planes_.size(); }
 
   float GetQVal(int sample) const override {
@@ -222,11 +227,35 @@ class DemuxingNetwork final : public Network {
     for (const auto& name : parents) {
       AddBackend(i++, name, weights, options.GetSubdict(name));
     }
+
+    // Validate static split configuration.
+    if (!static_split_.empty()) {
+      if (static_split_.size() != backends_.size()) {
+        Abort();  // Stop worker threads before throwing.
+        throw Exception("split must be specified for all backends or none");
+      }
+      int total = 0;
+      for (int s : static_split_) total += s;
+      std::string msg = "Demux static split: total=" + std::to_string(total);
+      for (size_t j = 0; j < static_split_.size(); j++) {
+        msg += " [" + std::to_string(j) + "]=" +
+               std::to_string(static_split_[j]);
+      }
+      CERR << msg;
+    }
   }
 
   void AddBackend(int index, const std::string& name,
                   const std::optional<WeightsFile>& weights,
                   const OptionsDict& opts) {
+    // Read split option before creating sub-backend (marks it as consumed).
+    int split = opts.GetOrDefault<int>("split", 0);
+    if (split > 0) {
+      if ((int)static_split_.size() <= index)
+        static_split_.resize(index + 1, 0);
+      static_split_[index] = split;
+    }
+
     const std::string backend = opts.GetOrDefault<std::string>("backend", name);
 
     auto network = NetworkFactory::Get()->Create(backend, weights, opts);
@@ -251,6 +280,11 @@ class DemuxingNetwork final : public Network {
   }
 
   int GetMiniBatchSize() const override {
+    if (!static_split_.empty()) {
+      int total = 0;
+      for (int s : static_split_) total += s;
+      return total;
+    }
     return min_batch_size_ * backends_.size();
   }
 
@@ -268,6 +302,7 @@ class DemuxingNetwork final : public Network {
   }
 
   std::vector<DemuxingBackend> backends_;
+  std::vector<int> static_split_;  // Empty = use original round-robin demux.
   NetworkCapabilities capabilities_;
   int min_batch_size_ = std::numeric_limits<int>::max();
   int batch_step_ = 1;
@@ -278,6 +313,62 @@ class DemuxingNetwork final : public Network {
 
 void DemuxingComputation::ComputeBlocking() {
   if (GetBatchSize() == 0) return;
+
+  if (!network_->static_split_.empty()) {
+    EnqueueStaticSplit();
+  } else {
+    EnqueueRoundRobin();
+  }
+
+  // Wait until all backends complete their work.
+  std::unique_lock<std::mutex> lock(mutex_);
+  dataready_cv_.wait(lock, [this]() {
+    return dataready_.load(std::memory_order_acquire) <= 0;
+  });
+}
+
+void DemuxingComputation::EnqueueStaticSplit() {
+  const int total = GetBatchSize();
+  const int n = network_->backends_.size();
+
+  // Compute per-backend sizes from static_split_.
+  int split_total = 0;
+  for (int s : network_->static_split_) split_total += s;
+
+  std::vector<int> sizes(n, 0);
+  if (total >= split_total) {
+    sizes = network_->static_split_;
+    sizes[n - 1] += total - split_total;
+  } else {
+    // Partial batch: scale down proportionally.
+    int remaining = total;
+    for (int i = 0; i < n - 1; i++) {
+      sizes[i] = total * network_->static_split_[i] / split_total;
+      remaining -= sizes[i];
+    }
+    sizes[n - 1] = remaining;
+  }
+
+  int work_items = 0;
+  for (int s : sizes)
+    if (s > 0) work_items++;
+
+  dataready_.store(work_items, std::memory_order_relaxed);
+  parents_.reserve(work_items);
+
+  int work_start = 0;
+  for (int i = 0; i < n; i++) {
+    if (sizes[i] <= 0) continue;
+    int work_end = std::min(work_start + sizes[i], total);
+    parents_.emplace_back(this, work_start, work_end);
+    network_->backends_[i].Enqueue(&parents_.back());
+    work_start = work_end;
+  }
+  assert(work_start == total);
+  assert(work_items == (int)parents_.size());
+}
+
+void DemuxingComputation::EnqueueRoundRobin() {
   // Calculate batch_step_ size split count.
   int splits = 1 + (GetBatchSize() - 1) / network_->batch_step_;
   // Calculate the minimum number of splits per backend.
@@ -326,11 +417,6 @@ void DemuxingComputation::ComputeBlocking() {
   }
   assert(work_start == GetBatchSize());
   assert(work_items == (int)parents_.size());
-  // Wait until all backends complete their work.
-  std::unique_lock<std::mutex> lock(mutex_);
-  dataready_cv_.wait(lock, [this]() {
-    return dataready_.load(std::memory_order_acquire) <= 0;
-  });
 }
 
 std::unique_ptr<Network> MakeDemuxingNetwork(
